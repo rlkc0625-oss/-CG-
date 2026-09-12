@@ -8,7 +8,7 @@ from PIL import Image, ImageEnhance, ImageOps
 st.set_page_config(page_title="図面→内観CGメーカー", page_icon="🏠", layout="centered")
 
 st.title("🏠 図面→内観CGメーカー")
-st.caption("無料AI Horde版 Ver.4 — 図面を『室内から見たCG』へ変換")
+st.caption("無料AI Horde版 Ver.5 — リアルカラー内観CG")
 
 uploaded = st.file_uploader("① 図面をアップロード", type=["png", "jpg", "jpeg", "webp"])
 
@@ -72,42 +72,83 @@ if uploaded:
         }[view]
 
         prompt = f"""
-Create a photorealistic architectural interior visualization from the uploaded floor-plan image.
+Generate a HIGH-END, FULL-COLOR, PHOTOREALISTIC ARCHITECTURAL INTERIOR PHOTOGRAPH
+based on the uploaded floor plan.
 
-IMPORTANT: The uploaded image is a FLOOR PLAN REFERENCE, NOT the final image.
-Do NOT return the floor plan, blueprint, top-down drawing, or photograph of paper.
-Instead, reconstruct the likely INTERIOR SPACE and render it as a realistic eye-level architectural photograph.
+The uploaded image is ONLY a floor-plan REFERENCE.
+The final image MUST look like a finished residential interior photograph / professional
+architectural visualization, NOT like a drawing.
 
-VIEW: {view_text}
-INTERIOR STYLE: {style_text}
-LIGHTING: {light_text}
+ABSOLUTE OUTPUT RULES:
+- FULL COLOR.
+- Photorealistic materials, realistic lighting, realistic shadows and reflections.
+- Looks like a professional Japanese house interior CG photographed with a real camera.
+- DO NOT make a sketch.
+- DO NOT make line art.
+- DO NOT make a blueprint.
+- DO NOT trace the floor plan.
+- DO NOT reproduce the paper or the original drawing.
+- DO NOT leave black architectural drawing lines on walls, floors, ceilings or furniture.
+- DO NOT use monochrome, grayscale, pencil, ink, watercolor or illustration styles.
+- No text, dimensions, handwritten notes, symbols, labels, logos or watermarks.
 
-GEOMETRY PRESERVATION:
-- Carefully inspect the floor plan first.
-- Preserve the shown room arrangement and relative spatial relationships.
-- Preserve wall locations, major openings, doors, windows, kitchen location, and circulation as much as possible.
-- Do not invent additional rooms or move major walls.
-- Do not arbitrarily move doors or windows.
-- Do not change the basic LDK proportions.
-- If something is unclear, make a conservative architectural inference rather than redesigning the plan.
+CAMERA / SPACE:
+- Eye-level camera approximately 1.5 m above the finished floor.
+- Natural wide-angle architectural photography.
+- Correct perspective.
+- Realistic ceiling height and furniture scale.
+- The viewer is standing INSIDE the house.
+- Show an actual finished room with floor, walls, ceiling, windows, doors, kitchen,
+  lighting and furniture.
 
-OUTPUT:
-- Photorealistic residential interior CG/photo.
-- Eye-level camera around 1.5 m above floor.
-- Natural perspective and believable room proportions.
-- Show floor, walls, ceiling, lighting, kitchen/cabinetry and only compatible furniture.
-- No floor-plan lines, handwritten marks, dimensions, labels, Japanese text, logos or watermarks.
-- Do not show the source paper.
+VIEW:
+{view_text}
 
-ADDITIONAL USER INSTRUCTIONS:
+INTERIOR STYLE:
+{style_text}
+
+LIGHTING:
+{light_text}
+
+FLOOR PLAN ACCURACY:
+- Read the floor plan before creating the room.
+- Keep the room arrangement and major geometry consistent with the floor plan.
+- Keep major walls, openings, doors, windows, kitchen position and circulation
+  in their indicated relative locations.
+- Do not add rooms.
+- Do not remove rooms.
+- Do not move major walls.
+- Do not arbitrarily relocate doors, windows or kitchen.
+- When a small detail cannot be read, make the smallest reasonable architectural
+  inference rather than redesigning the space.
+
+MATERIAL QUALITY:
+- physically believable wood, tile, stone, painted walls and cabinetry;
+- subtle natural texture;
+- realistic indirect light;
+- realistic contact shadows;
+- realistic glass and metal;
+- premium residential photography quality.
+
+USER'S ADDITIONAL INSTRUCTIONS:
 {custom}
+"""
+
+        # 強いネガティブ指示を追加して、線画・図面返しを抑える
+        prompt += """
+NEGATIVE REQUIREMENTS:
+sketch, drawing, line drawing, blueprint, floor plan, plan view, top-down view,
+pencil drawing, ink drawing, grayscale, monochrome, cartoon, illustration,
+wireframe, architectural diagram, paper, document, handwritten notes,
+dimension lines, floor-plan symbols, traced lines, black outlines.
+The final image must be a COLOR, FINISHED, PHOTOREALISTIC INTERIOR.
 """
 
         payload = {
             "prompt": prompt,
             "params": {
                 "width": 576, "height": 576, "steps": 15,
-                "cfg_scale": 6.5, "denoising_strength": 0.65,
+                "cfg_scale": 6.5, "denoising_strength": 0.78,
                 "sampler_name": "k_euler", "n": 1
             },
             "source_image": source_b64,

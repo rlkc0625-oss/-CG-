@@ -15,7 +15,7 @@ HEADERS = {
 
 st.set_page_config(page_title="図面→内観CGメーカー", page_icon="🏠", layout="centered")
 st.title("🏠 図面→内観CGメーカー")
-st.caption("無料AI Horde版 Ver.8 — 『図面を描き直す』のではなく『内観CGを生成』する方式")
+st.caption("無料AI Horde版 Ver.9 — 安全な無人住宅内観CG")
 
 uploaded = st.file_uploader("① 図面をアップロード", type=["png", "jpg", "jpeg", "webp"])
 
@@ -171,7 +171,15 @@ if uploaded:
         # これが「図面線画のまま返る」問題を避けるポイント。
         prompt = f"""
 Create a finished, FULL-COLOR, PHOTOREALISTIC high-end Japanese residential
-INTERIOR ARCHITECTURAL VISUALIZATION.
+INTERIOR ARCHITECTURAL VISUALIZATION of an EMPTY HOME INTERIOR.
+
+SAFETY / CONTENT:
+- The image contains NO people, NO children, NO adults, NO human figures,
+  NO silhouettes, NO mannequins, NO portraits, and NO human-like characters.
+- Show only architecture, furniture, fixtures, materials and lighting.
+- This is a completely ordinary family home interior with no sexual or
+  suggestive content of any kind.
+
 
 This is an interior photograph/CG of a completed house.
 The final image MUST NOT look like a floor plan, drawing, sketch, blueprint,
@@ -209,12 +217,14 @@ ABSOLUTELY FORBIDDEN:
 floor plan, blueprint, sketch, pencil, ink, line drawing, black outlines,
 wireframe, diagram, paper, document, dimensions, Japanese labels, handwritten
 notes, plan symbols, grayscale, monochrome, cartoon, illustration, tracing,
-architectural drawing.
+architectural drawing, people, person, child, adult, human figure, silhouette,
+mannequin, portrait, body, face.
 
 Additional user instructions:
 {custom}
 """
 
+        # 図面の説明はあくまで建築情報として使用し、人物等は生成しない。
         payload = {
             "prompt": prompt,
             "params": {
@@ -222,7 +232,7 @@ Additional user instructions:
                 "height": 576,
                 "steps": 20,
                 "cfg_scale": 7.0,
-                "negative_prompt": "floor plan, blueprint, sketch, line art, pencil drawing, ink drawing, architectural drawing, diagram, grayscale, monochrome, wireframe, paper, document, handwritten notes, dimensions, labels, black outlines, traced lines, cartoon, illustration, top-down view"
+                "negative_prompt": "floor plan, blueprint, sketch, line art, pencil drawing, ink drawing, architectural drawing, diagram, grayscale, monochrome, wireframe, paper, document, handwritten notes, dimensions, labels, black outlines, traced lines, cartoon, illustration, top-down view, people, person, child, adult, human figure, silhouette, mannequin, portrait, face, body, nudity, sexual content"
             },
             "nsfw": False
         }

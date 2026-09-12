@@ -8,7 +8,7 @@ from PIL import Image, ImageEnhance, ImageOps
 st.set_page_config(page_title="図面→内観CGメーカー", page_icon="🏠", layout="centered")
 
 st.title("🏠 図面→内観CGメーカー")
-st.caption("無料AI Horde版 Ver.5 — リアルカラー内観CG")
+st.caption("無料AI Horde版 Ver.6 — フォトリアルモデル版")
 
 uploaded = st.file_uploader("① 図面をアップロード", type=["png", "jpg", "jpeg", "webp"])
 

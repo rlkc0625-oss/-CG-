@@ -112,15 +112,21 @@ ADDITIONAL USER INSTRUCTIONS:
             },
             "source_image": source_b64,
             "source_processing": "img2img",
-            "apikey": "0000000000",
             "nsfw": False
+        }
+
+        # AI HordeのAPIキーはHTTPヘッダーで送ります
+        horde_headers = {
+            "Content-Type": "application/json",
+            "apikey": "0000000000",
+            "Client-Agent": "FloorplanCG-Free/4.1"
         }
 
         with st.spinner("AIが図面を解析して室内CGを生成しています…"):
             try:
                 r = requests.post(
                     "https://aihorde.net/api/v2/generate/async",
-                    json=payload, timeout=60
+                    json=payload, headers=horde_headers, timeout=60
                 )
                 if r.status_code >= 400:
                     st.error(f"AI Hordeエラー {r.status_code}: {r.text}")
@@ -136,6 +142,7 @@ ADDITIONAL USER INSTRUCTIONS:
                     time.sleep(2)
                     check = requests.get(
                         f"https://aihorde.net/api/v2/generate/check/{job_id}",
+                        headers=horde_headers,
                         timeout=30
                     )
                     if check.status_code >= 400:
@@ -146,6 +153,7 @@ ADDITIONAL USER INSTRUCTIONS:
                     if status.get("done"):
                         result_r = requests.get(
                             f"https://aihorde.net/api/v2/generate/status/{job_id}",
+                            headers=horde_headers,
                             timeout=60
                         )
                         if result_r.status_code >= 400:

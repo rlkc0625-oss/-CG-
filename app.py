@@ -5,26 +5,98 @@ import requests
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageOps
 
-st.set_page_config(page_title="図面→内観CGメーカー", page_icon="🏠", layout="centered")
+API = "https://aihorde.net/api/v2"
+KEY = "0000000000"
+HEADERS = {
+    "Content-Type": "application/json",
+    "apikey": KEY,
+    "Client-Agent": "FloorplanCG-Free/8.0"
+}
 
+st.set_page_config(page_title="図面→内観CGメーカー", page_icon="🏠", layout="centered")
 st.title("🏠 図面→内観CGメーカー")
-st.caption("無料AI Horde版 Ver.6 — フォトリアルモデル版")
+st.caption("無料AI Horde版 Ver.8 — 『図面を描き直す』のではなく『内観CGを生成』する方式")
 
 uploaded = st.file_uploader("① 図面をアップロード", type=["png", "jpg", "jpeg", "webp"])
 
 view = st.selectbox("② 視点", [
-    "LDK全体", "リビング側からキッチンを見る", "キッチン側からリビングを見る",
-    "ダイニング側からLDKを見る", "玄関ホール", "自由指定"
+    "LDK全体",
+    "リビング側からキッチンを見る",
+    "キッチン側からリビングを見る",
+    "ダイニング側からLDKを見る",
+    "玄関ホール",
+    "自由指定"
 ])
 
 style = st.selectbox("③ インテリア", [
-    "ナチュラル", "グレージュモダン", "ホテルライク", "北欧",
-    "和モダン", "シンプルモダン", "自由指定"
+    "ナチュラル",
+    "グレージュモダン",
+    "ホテルライク",
+    "北欧",
+    "和モダン",
+    "シンプルモダン",
+    "自由指定"
 ])
 
 lighting = st.selectbox("④ 時間帯", ["昼", "夕方", "夜"])
-custom = st.text_area("⑤ 追加指示（任意）",
-    placeholder="例：床は明るいオーク、壁は白、間接照明を入れる。高級感のある住宅CGにする。")
+
+custom = st.text_area(
+    "⑤ 追加指示（任意）",
+    placeholder="例：床は明るいオーク、壁は白、キッチンはグレージュ、高級感のある住宅CG"
+)
+
+def wait_interrogation(job_id):
+    for _ in range(120):
+        time.sleep(2)
+        r = requests.get(f"{API}/interrogate/status/{job_id}",
+                         headers=HEADERS, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"図面解析確認エラー {r.status_code}: {r.text}")
+        data = r.json()
+        state = data.get("state", "")
+        if state == "done":
+            forms = data.get("forms") or []
+            for form in forms:
+                result = form.get("result") or {}
+                if result.get("caption"):
+                    return result["caption"]
+                if result.get("interrogation"):
+                    return str(result["interrogation"])
+            return "住宅の平面図。LDK、居室、水回り、収納などを含む住宅レイアウト。"
+        if state in ("faulted", "cancelled"):
+            raise RuntimeError(f"図面解析に失敗しました: {data}")
+    raise RuntimeError("図面解析がタイムアウトしました。")
+
+def wait_image(job_id):
+    for _ in range(150):
+        time.sleep(2)
+        r = requests.get(f"{API}/generate/check/{job_id}",
+                         headers=HEADERS, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"画像生成確認エラー {r.status_code}: {r.text}")
+        check = r.json()
+        if check.get("done"):
+            r2 = requests.get(f"{API}/generate/status/{job_id}",
+                              headers=HEADERS, timeout=60)
+            if r2.status_code >= 400:
+                raise RuntimeError(f"画像結果取得エラー {r2.status_code}: {r2.text}")
+            data = r2.json()
+            gens = data.get("generations") or []
+            if not gens:
+                raise RuntimeError(f"画像が返されませんでした: {data}")
+            return gens[0].get("img")
+    raise RuntimeError("画像生成がタイムアウトしました。")
+
+def get_image_bytes(img):
+    if not img:
+        raise RuntimeError("画像URLを取得できませんでした。")
+    if img.startswith("data:image"):
+        return base64.b64decode(img.split(",", 1)[1])
+    if img.startswith("http"):
+        r = requests.get(img, timeout=60)
+        r.raise_for_status()
+        return r.content
+    return base64.b64decode(img)
 
 if uploaded:
     src = Image.open(io.BytesIO(uploaded.getvalue())).convert("RGB")
@@ -36,8 +108,8 @@ if uploaded:
         src = src.resize((int(src.width * scale), int(src.height * scale)),
                          Image.Resampling.LANCZOS)
 
-    src = ImageEnhance.Contrast(src).enhance(1.18)
-    src = ImageEnhance.Sharpness(src).enhance(1.15)
+    src = ImageEnhance.Contrast(src).enhance(1.15)
+    src = ImageEnhance.Sharpness(src).enhance(1.10)
 
     buf = io.BytesIO()
     src.save(buf, format="WEBP", quality=88, method=6)
@@ -47,199 +119,144 @@ if uploaded:
 
     if st.button("✨ CGを生成", type="primary", use_container_width=True):
         style_text = {
-            "ナチュラル": "明るいナチュラル住宅、木質感のある床、白〜淡色の壁",
-            "グレージュモダン": "上品なグレージュ、木と石を組み合わせた現代的な住宅",
-            "ホテルライク": "高級ホテルのような落ち着いた住宅、石・木・間接照明",
-            "北欧": "明るい北欧住宅、淡い木、白い壁、柔らかな家具",
-            "和モダン": "現代的な和モダン住宅、木、石、落ち着いた色",
-            "シンプルモダン": "無駄を抑えた上質なシンプルモダン住宅",
-            "自由指定": custom or "上質で自然な住宅インテリア"
+            "ナチュラル": "warm Japanese natural modern home, light oak flooring, warm white walls, refined wood cabinetry",
+            "グレージュモダン": "luxury greige modern Japanese home, warm gray walls, oak wood, stone accents",
+            "ホテルライク": "high-end luxury hotel-like Japanese residence, stone, wood, elegant indirect lighting",
+            "北欧": "bright Scandinavian-inspired Japanese home, pale oak, soft white walls, simple elegant furniture",
+            "和モダン": "premium contemporary Japanese modern home, natural wood, stone, calm neutral palette",
+            "シンプルモダン": "premium minimalist modern Japanese home, clean lines, sophisticated neutral materials",
+            "自由指定": custom or "premium contemporary Japanese residential interior"
         }[style]
 
-        light_text = {
-            "昼": "昼の自然光が大きな窓から入る明るい室内",
-            "夕方": "夕方の柔らかな自然光と暖色の照明",
-            "夜": "夜の落ち着いた室内、暖色の間接照明とダウンライト"
-        }[lighting]
-
         view_text = {
-            "LDK全体": "LDKの室内全体を見渡す広角のアイレベル視点",
-            "リビング側からキッチンを見る": "リビングに立ってキッチン方向を見るアイレベル視点",
-            "キッチン側からリビングを見る": "キッチン付近からリビング方向を見るアイレベル視点",
-            "ダイニング側からLDKを見る": "ダイニング側からLDK全体を見るアイレベル視点",
-            "玄関ホール": "玄関ホールに立って室内方向を見るアイレベル視点",
-            "自由指定": custom or "自然で使いやすいアイレベルの室内視点"
+            "LDK全体": "wide eye-level view of the LDK interior",
+            "リビング側からキッチンを見る": "standing in the living room looking toward the kitchen",
+            "キッチン側からリビングを見る": "standing near the kitchen looking toward the living room",
+            "ダイニング側からLDKを見る": "standing at the dining area looking across the LDK",
+            "玄関ホール": "standing in the entrance hall looking into the house",
+            "自由指定": custom or "natural eye-level interior architectural view"
         }[view]
 
+        light_text = {
+            "昼": "soft natural daylight",
+            "夕方": "warm late-afternoon sunlight mixed with interior lighting",
+            "夜": "warm sophisticated night lighting with downlights and indirect lighting"
+        }[lighting]
+
+        with st.spinner("① 図面をAIに解析しています…"):
+            try:
+                ir_payload = {
+                    "source_image": source_b64,
+                    "forms": [{"name": "caption"}]
+                }
+                ir = requests.post(f"{API}/interrogate/async",
+                                   json=ir_payload, headers=HEADERS, timeout=60)
+                if ir.status_code >= 400:
+                    st.error(f"図面解析エラー {ir.status_code}: {ir.text}")
+                    st.stop()
+
+                ir_id = ir.json().get("id")
+                if not ir_id:
+                    st.error(f"図面解析IDを取得できませんでした: {ir.text}")
+                    st.stop()
+
+                caption = wait_interrogation(ir_id)
+                st.info(f"AIの図面認識: {caption}")
+
+            except Exception as e:
+                st.warning(f"図面解析は利用できなかったため、選択した視点・内装条件でCGを生成します。\\n{e}")
+                caption = "住宅の平面図を参考にした住宅内部"
+
+        # ここでは元画像をimg2imgに渡さない。
+        # これが「図面線画のまま返る」問題を避けるポイント。
         prompt = f"""
-Generate a HIGH-END, FULL-COLOR, PHOTOREALISTIC ARCHITECTURAL INTERIOR PHOTOGRAPH
-based on the uploaded floor plan.
+Create a finished, FULL-COLOR, PHOTOREALISTIC high-end Japanese residential
+INTERIOR ARCHITECTURAL VISUALIZATION.
 
-The uploaded image is ONLY a floor-plan REFERENCE.
-The final image MUST look like a finished residential interior photograph / professional
-architectural visualization, NOT like a drawing.
+This is an interior photograph/CG of a completed house.
+The final image MUST NOT look like a floor plan, drawing, sketch, blueprint,
+diagram, paper document, or line art.
 
-ABSOLUTE OUTPUT RULES:
-- FULL COLOR.
-- Photorealistic materials, realistic lighting, realistic shadows and reflections.
-- Looks like a professional Japanese house interior CG photographed with a real camera.
-- DO NOT make a sketch.
-- DO NOT make line art.
-- DO NOT make a blueprint.
-- DO NOT trace the floor plan.
-- DO NOT reproduce the paper or the original drawing.
-- DO NOT leave black architectural drawing lines on walls, floors, ceilings or furniture.
-- DO NOT use monochrome, grayscale, pencil, ink, watercolor or illustration styles.
-- No text, dimensions, handwritten notes, symbols, labels, logos or watermarks.
-
-CAMERA / SPACE:
-- Eye-level camera approximately 1.5 m above the finished floor.
-- Natural wide-angle architectural photography.
-- Correct perspective.
-- Realistic ceiling height and furniture scale.
-- The viewer is standing INSIDE the house.
-- Show an actual finished room with floor, walls, ceiling, windows, doors, kitchen,
-  lighting and furniture.
-
-VIEW:
+CAMERA:
 {view_text}
+Eye-level camera around 1.5 meters high, realistic wide-angle architectural
+photography, natural perspective, realistic room proportions.
 
-INTERIOR STYLE:
+INTERIOR:
 {style_text}
 
-LIGHTING:
+LIGHT:
 {light_text}
 
-FLOOR PLAN ACCURACY:
-- Read the floor plan before creating the room.
-- Keep the room arrangement and major geometry consistent with the floor plan.
-- Keep major walls, openings, doors, windows, kitchen position and circulation
-  in their indicated relative locations.
-- Do not add rooms.
-- Do not remove rooms.
-- Do not move major walls.
-- Do not arbitrarily relocate doors, windows or kitchen.
-- When a small detail cannot be read, make the smallest reasonable architectural
-  inference rather than redesigning the space.
+FLOOR-PLAN REFERENCE DESCRIPTION:
+{caption}
 
-MATERIAL QUALITY:
-- physically believable wood, tile, stone, painted walls and cabinetry;
-- subtle natural texture;
-- realistic indirect light;
-- realistic contact shadows;
-- realistic glass and metal;
-- premium residential photography quality.
+Use the reference description only to infer the type of space and plausible
+relationship between rooms. The final image is a perspective interior view,
+NOT a reproduction of the plan.
 
-USER'S ADDITIONAL INSTRUCTIONS:
+REALISM:
+realistic wood grain, stone, tile, painted walls, glass, metal, fabric,
+natural reflections, contact shadows, physically plausible lighting,
+realistic furniture scale, professional architectural photography,
+premium Japanese custom home.
+
+The room must be clearly three-dimensional:
+floor, walls, ceiling, windows, doors, kitchen/cabinetry and furniture.
+No top-down view.
+
+ABSOLUTELY FORBIDDEN:
+floor plan, blueprint, sketch, pencil, ink, line drawing, black outlines,
+wireframe, diagram, paper, document, dimensions, Japanese labels, handwritten
+notes, plan symbols, grayscale, monochrome, cartoon, illustration, tracing,
+architectural drawing.
+
+Additional user instructions:
 {custom}
-"""
-
-        # 強いネガティブ指示を追加して、線画・図面返しを抑える
-        prompt += """
-NEGATIVE REQUIREMENTS:
-sketch, drawing, line drawing, blueprint, floor plan, plan view, top-down view,
-pencil drawing, ink drawing, grayscale, monochrome, cartoon, illustration,
-wireframe, architectural diagram, paper, document, handwritten notes,
-dimension lines, floor-plan symbols, traced lines, black outlines.
-The final image must be a COLOR, FINISHED, PHOTOREALISTIC INTERIOR.
 """
 
         payload = {
             "prompt": prompt,
             "params": {
-                "width": 576, "height": 576, "steps": 15,
-                "cfg_scale": 6.5, "denoising_strength": 0.78,
-                "sampler_name": "k_euler", "n": 1
+                "width": 576,
+                "height": 576,
+                "steps": 20,
+                "cfg_scale": 7.0,
+                "negative_prompt": "floor plan, blueprint, sketch, line art, pencil drawing, ink drawing, architectural drawing, diagram, grayscale, monochrome, wireframe, paper, document, handwritten notes, dimensions, labels, black outlines, traced lines, cartoon, illustration, top-down view"
             },
-            "source_image": source_b64,
-            "source_processing": "img2img",
             "nsfw": False
         }
 
-        # AI HordeのAPIキーはHTTPヘッダーで送ります
-        horde_headers = {
-            "Content-Type": "application/json",
-            "apikey": "0000000000",
-            "Client-Agent": "FloorplanCG-Free/4.1"
-        }
-
-        with st.spinner("AIが図面を解析して室内CGを生成しています…"):
+        with st.spinner("② 本物の室内CGを生成しています…"):
             try:
-                r = requests.post(
-                    "https://aihorde.net/api/v2/generate/async",
-                    json=payload, headers=horde_headers, timeout=60
-                )
-                if r.status_code >= 400:
-                    st.error(f"AI Hordeエラー {r.status_code}: {r.text}")
+                gen = requests.post(f"{API}/generate/async",
+                                   json=payload, headers=HEADERS, timeout=60)
+                if gen.status_code >= 400:
+                    st.error(f"AI Horde画像生成エラー {gen.status_code}: {gen.text}")
                     st.stop()
 
-                job_id = r.json().get("id")
+                job_id = gen.json().get("id")
                 if not job_id:
-                    st.error(f"生成IDを取得できませんでした: {r.text}")
+                    st.error(f"生成IDを取得できませんでした: {gen.text}")
                     st.stop()
 
-                result = None
-                for _ in range(90):
-                    time.sleep(2)
-                    check = requests.get(
-                        f"https://aihorde.net/api/v2/generate/check/{job_id}",
-                        headers=horde_headers,
-                        timeout=30
-                    )
-                    if check.status_code >= 400:
-                        st.error(f"生成確認エラー {check.status_code}: {check.text}")
-                        st.stop()
+                img = wait_image(job_id)
+                output = Image.open(io.BytesIO(get_image_bytes(img))).convert("RGB")
 
-                    status = check.json()
-                    if status.get("done"):
-                        result_r = requests.get(
-                            f"https://aihorde.net/api/v2/generate/status/{job_id}",
-                            headers=horde_headers,
-                            timeout=60
-                        )
-                        if result_r.status_code >= 400:
-                            st.error(f"結果取得エラー {result_r.status_code}: {result_r.text}")
-                            st.stop()
-                        result = result_r.json()
-                        break
-
-                if not result:
-                    st.error("生成に時間がかかっています。もう一度お試しください。")
-                    st.stop()
-
-                generations = result.get("generations", [])
-                if not generations:
-                    st.error(f"画像が返されませんでした: {result}")
-                    st.stop()
-
-                img_url = generations[0].get("img")
-                if not img_url:
-                    st.error(f"画像URLを取得できませんでした: {generations[0]}")
-                    st.stop()
-
-                if img_url.startswith("data:image"):
-                    _, encoded = img_url.split(",", 1)
-                    image_bytes = base64.b64decode(encoded)
-                elif img_url.startswith("http"):
-                    image_bytes = requests.get(img_url, timeout=60).content
-                else:
-                    image_bytes = base64.b64decode(img_url)
-
-                output = Image.open(io.BytesIO(image_bytes)).convert("RGB")
                 st.success("生成完了")
                 st.image(output, caption="生成された内観CG", use_container_width=True)
 
                 out = io.BytesIO()
                 output.save(out, format="PNG")
                 st.download_button(
-                    "📥 CGを保存", data=out.getvalue(),
-                    file_name="interior_cg.png", mime="image/png"
+                    "📥 CGを保存",
+                    data=out.getvalue(),
+                    file_name="interior_cg.png",
+                    mime="image/png"
                 )
 
-            except requests.RequestException as e:
-                st.error(f"AI Hordeとの通信に失敗しました：{e}")
             except Exception as e:
                 st.error(f"生成に失敗しました：{e}")
 
 st.divider()
-st.caption("※無料検証版です。AI画像生成のため、寸法・壁・窓・ドアを完全一致させるCAD/BIMではありません。")
+st.caption("※無料検証版。今回は『まず本物のカラー内観CGを出す』ことを優先しています。寸法・壁・窓・ドアの完全一致は次段階の課題です。")

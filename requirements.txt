@@ -1,8 +1,9 @@
-streamlit
-pillow
-numpy
-opencv-python-headless
-torch
-torchvision
-safetensors
-
+streamlit>=1.42,<2
+pillow>=10.4,<12
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<5
+requests>=2.32,<3
+torch>=2.2,<3
+torchvision>=0.17,<1
+segmentation-models-pytorch==0.3.4
+safetensors>=0.4,<1

@@ -9,3 +9,4 @@ segmentation-models-pytorch==0.3.4
 timm<1
 safetensors>=0.4,<1
 matplotlib>=3.8,<4
+

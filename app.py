@@ -12,11 +12,12 @@ import trimesh
 
 st.set_page_config(page_title='図面→3D内観CG', page_icon='🏠', layout='wide')
 
-MODEL_URL = 'https://huggingface.co/Yytsi/floorplan-to-3d-walls/resolve/main/best.safetensors?download=true'
-MODEL_SHA256 = 'd7f6a0fd06e2931aecfc8c4849192c5e153701578026efc78d9a6246731a8d6c'
-MODEL_BYTES = 97991168
-CACHE = Path.home() / '.cache' / 'floorplan_cg'
-MODEL_PATH = CACHE / 'best.safetensors'
+MODEL_REPO = "Yytsi/floorplan-to-3d-walls"
+MODEL_FILENAME = "best.safetensors"
+MODEL_SHA256 = "d7f6a0fd06e2931aecfc8c4849192c5e153701578026efc78d9a6246731a8d6c"
+CACHE = Path.home() / ".cache" / "floorplan_cg"
+MODEL_PATH = CACHE / MODEL_FILENAME
+
 
 STYLES = {
     'ナチュラル': {'floor':'#c9a77a','wall':'#f2eee6','ceiling':'#faf9f5','wood':'#b58b5b','accent':'#d8c8b2','glass':'#b8d9e8'},
@@ -35,27 +36,29 @@ def sha256(path):
 
 
 def download_model():
+    # Hugging Face Xet/LFS の実体ファイルを取得。
+    # ファイルサイズはリポジトリ側の表示と転送実体で差が出ることがあるため、
+    # サイズではなく公式SHA256を最終判定に使います。
     CACHE.mkdir(parents=True, exist_ok=True)
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size == MODEL_BYTES:
-        if sha256(MODEL_PATH) == MODEL_SHA256: return MODEL_PATH
-        MODEL_PATH.unlink(missing_ok=True)
-    tmp=MODEL_PATH.with_suffix('.part')
-    try:
-        with requests.get(MODEL_URL, stream=True, timeout=(15,180), headers={'User-Agent':'floorplan-cg/1.0'}) as r:
-            r.raise_for_status()
-            total=0
-            with open(tmp,'wb') as f:
-                for chunk in r.iter_content(1024*1024):
-                    if chunk:
-                        f.write(chunk); total += len(chunk)
-                        if total > MODEL_BYTES + 1024*1024: raise RuntimeError('モデルサイズが想定値を超えました。')
-        if total != MODEL_BYTES or sha256(tmp) != MODEL_SHA256:
-            raise RuntimeError('AIモデルの整合性確認に失敗しました。')
-        os.replace(tmp, MODEL_PATH)
+    if MODEL_PATH.exists() and sha256(MODEL_PATH) == MODEL_SHA256:
         return MODEL_PATH
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    MODEL_PATH.unlink(missing_ok=True)
+    try:
+        from huggingface_hub import hf_hub_download
+        downloaded = hf_hub_download(
+            repo_id=MODEL_REPO,
+            filename=MODEL_FILENAME,
+            revision="main",
+            cache_dir=str(CACHE / "hf"),
+        )
+        got = sha256(downloaded)
+        if got != MODEL_SHA256:
+            raise RuntimeError(f"AIモデルのSHA256検証に失敗しました。取得値: {got}")
+        import shutil
+        shutil.copy2(downloaded, MODEL_PATH)
+        return MODEL_PATH
+    except Exception as e:
+        raise RuntimeError(f"AIモデルを取得できませんでした: {e}") from e
 
 
 @st.cache_resource(show_spinner=False)
@@ -293,4 +296,5 @@ if upload:
                 st.download_button('構造JSON',json.dumps(structure,ensure_ascii=False,indent=2).encode(),'structure.json','application/json')
     except Exception as e:
         st.error(f'生成できませんでした: {type(e).__name__}: {e}')
-        st.info('図面を正面から撮影し、建物部分ができるだけ大きく写った画像で再実行してください。')
+        if 'AIモデル' not in str(e) and 'huggingface' not in str(e).lower():
+            st.info('図面を正面から撮影し、建物部分ができるだけ大きく写った画像で再実行してください。')

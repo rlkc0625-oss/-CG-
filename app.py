@@ -182,70 +182,154 @@ def polygon_area(poly):
     return abs(cv2.contourArea(p.astype(np.float32)))
 
 
+def _touches_canvas(poly, margin=3):
+    p = np.asarray(poly, dtype=float)
+    if len(p) == 0:
+        return True
+    return bool(
+        (p[:, 0].min() <= margin) or (p[:, 1].min() <= margin)
+        or (p[:, 0].max() >= SIZE - 1 - margin)
+        or (p[:, 1].max() >= SIZE - 1 - margin)
+    )
+
+
 def largest_floor(geometry):
     floors = geometry.get("floor", [])
-    if not floors:
+    candidates = [p for p in floors if not _touches_canvas(p.get("outer", []))]
+    if not candidates:
+        candidates = floors
+    if not candidates:
         return None
-    return max(floors, key=lambda p: polygon_area(p["outer"]))
+    return max(candidates, key=lambda p: polygon_area(p["outer"]))
+
+
+def _all_points(geometry):
+    pts = []
+    for name in ("wall", "door", "window"):
+        for poly in geometry.get(name, []):
+            pts.extend(poly.get("outer", []))
+    if not pts:
+        return None
+    return np.asarray(pts, dtype=float)
+
+
+def _wall_segments(geometry, scale, yflip=True):
+    """Return vertical wall segments from the predicted wall polygons."""
+    segments = []
+    for poly in geometry.get("wall", []):
+        p = np.asarray(poly.get("outer", []), dtype=float)
+        if len(p) < 2:
+            continue
+        for a, b in zip(p, np.vstack([p[1:], p[:1]])):
+            ax, ay = float(a[0] * scale), float((SIZE - a[1]) * scale if yflip else a[1] * scale)
+            bx, by = float(b[0] * scale), float((SIZE - b[1]) * scale if yflip else b[1] * scale)
+            length = math.hypot(bx - ax, by - ay)
+            if length >= 0.08:
+                segments.append((ax, ay, bx, by))
+    return segments
+
+
+def _add_wall_segment(ax, x0, y0, x1, y1, height, thickness, color):
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    if length <= 1e-6:
+        return
+    nx, ny = -dy / length, dx / length
+    t = thickness / 2.0
+    p0 = (x0 + nx*t, y0 + ny*t)
+    p1 = (x1 + nx*t, y1 + ny*t)
+    p2 = (x1 - nx*t, y1 - ny*t)
+    p3 = (x0 - nx*t, y0 - ny*t)
+    verts = [
+        [(p0[0], p0[1], 0), (p1[0], p1[1], 0), (p1[0], p1[1], height), (p0[0], p0[1], height)],
+        [(p1[0], p1[1], 0), (p2[0], p2[1], 0), (p2[0], p2[1], height), (p1[0], p1[1], height)],
+        [(p2[0], p2[1], 0), (p3[0], p3[1], 0), (p3[0], p3[1], height), (p2[0], p2[1], height)],
+        [(p3[0], p3[1], 0), (p0[0], p0[1], 0), (p0[0], p0[1], height), (p3[0], p3[1], height)],
+    ]
+    ax.add_collection3d(Poly3DCollection(verts, facecolors=color, edgecolors="none", alpha=0.98))
+
+
+def _add_panel(ax, poly, scale, height, color, alpha=0.9):
+    p = np.asarray(poly.get("outer", []), dtype=float)
+    if len(p) < 3:
+        return
+    q = np.column_stack([p[:, 0] * scale, (SIZE - p[:, 1]) * scale])
+    cx, cy = q[:, 0].mean(), q[:, 1].mean()
+    rx = max((q[:, 0].max() - q[:, 0].min()) / 2, 0.025)
+    ry = max((q[:, 1].max() - q[:, 1].min()) / 2, 0.025)
+    if rx >= ry:
+        x0, x1 = cx - rx, cx + rx
+        y0, y1 = cy - max(0.025, min(0.06, ry)), cy + max(0.025, min(0.06, ry))
+    else:
+        x0, x1 = cx - max(0.025, min(0.06, rx)), cx + max(0.025, min(0.06, rx))
+        y0, y1 = cy - ry, cy + ry
+    z0 = 0.0
+    verts = [[(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)],
+             [(x0,y0,height),(x1,y0,height),(x1,y1,height),(x0,y1,height)]]
+    ax.add_collection3d(Poly3DCollection(verts, facecolors=color, edgecolors="none", alpha=alpha))
 
 
 def build_preview_mesh(geometry, style_name):
-    """Build a lightweight deterministic 3D preview from the segmentation mask.
-    This is a visualization, not a construction-accurate BIM/CAD model.
-    """
     scale = 0.025
     wall_h = 2.4
     floor_poly = largest_floor(geometry)
-    if floor_poly is None:
-        raise RuntimeError("床領域を認識できなかったため、3D化できませんでした。")
+    wall_pts = _all_points(geometry)
+    if wall_pts is None and floor_poly is None:
+        raise RuntimeError("床・壁領域を認識できなかったため、3D化できませんでした。")
 
-    pts = np.asarray(floor_poly["outer"], dtype=float)
-    pts[:, 0] *= scale
-    pts[:, 1] = (SIZE - pts[:, 1]) * scale
+    if floor_poly is not None:
+        pts = np.asarray(floor_poly["outer"], dtype=float)
+        pts[:, 0] *= scale
+        pts[:, 1] = (SIZE - pts[:, 1]) * scale
+    else:
+        wp = wall_pts.copy()
+        pts = np.array([
+            [wp[:,0].min()*scale, (SIZE-wp[:,1].max())*scale],
+            [wp[:,0].max()*scale, (SIZE-wp[:,1].max())*scale],
+            [wp[:,0].max()*scale, (SIZE-wp[:,1].min())*scale],
+            [wp[:,0].min()*scale, (SIZE-wp[:,1].min())*scale],
+        ])
+
     xmin, xmax = pts[:, 0].min(), pts[:, 0].max()
     ymin, ymax = pts[:, 1].min(), pts[:, 1].max()
     if xmax - xmin < 2 or ymax - ymin < 2:
-        raise RuntimeError("認識された床領域が小さすぎます。")
-
-    palette = STYLE[style_name]
-    return pts, (xmin, xmax, ymin, ymax), palette, wall_h
-
-
-def cuboid(ax, x0, x1, y0, y1, z0, z1, color, alpha=1.0):
-    verts = [
-        [(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)],
-        [(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)],
-        [(x0,y0,z0),(x1,y0,z0),(x1,y0,z1),(x0,y0,z1)],
-        [(x1,y0,z0),(x1,y1,z0),(x1,y1,z1),(x1,y0,z1)],
-        [(x1,y1,z0),(x0,y1,z0),(x0,y1,z1),(x1,y1,z1)],
-        [(x0,y1,z0),(x0,y0,z0),(x0,y0,z1),(x0,y1,z1)],
-    ]
-    ax.add_collection3d(Poly3DCollection(verts, facecolors=color, edgecolors="none", alpha=alpha))
+        raise RuntimeError("認識された室内領域が小さすぎます。")
+    return pts, (xmin, xmax, ymin, ymax), STYLE[style_name], wall_h
 
 
 def make_cg(geometry, style_name, lighting, view_name):
     pts, bounds, palette, wall_h = build_preview_mesh(geometry, style_name)
     xmin, xmax, ymin, ymax = bounds
-    lx, ly, lz = LIGHT[lighting]
     fig = plt.figure(figsize=(10, 7), dpi=160)
     ax = fig.add_subplot(111, projection="3d")
     fig.patch.set_facecolor("#EDEBE6")
     ax.set_facecolor("#EDEBE6")
 
-    # Floor surface
-    floor3 = [(x, y, 0) for x, y in pts]
-    ax.add_collection3d(Poly3DCollection([floor3], facecolors=palette["floor"], edgecolors="none", alpha=1))
+    floor3 = [(float(x), float(y), 0) for x, y in pts]
+    ax.add_collection3d(Poly3DCollection([floor3], facecolors=palette["floor"], edgecolors="none", alpha=1.0))
 
-    # Boundary walls from floor bounding box. This intentionally creates a stable room shell
-    # even when the segmentation returns fragmented wall contours.
-    t = max(0.12, min((xmax-xmin), (ymax-ymin)) * 0.018)
-    cuboid(ax, xmin, xmax, ymin, ymin+t, 0, wall_h, palette["wall"])
-    cuboid(ax, xmin, xmax, ymax-t, ymax, 0, wall_h, palette["wall"])
-    cuboid(ax, xmin, xmin+t, ymin, ymax, 0, wall_h, palette["wall"])
-    cuboid(ax, xmax-t, xmax, ymin, ymax, 0, wall_h, palette["wall"])
-
-    # Simple architectural furniture blocks, kept generic so no fake product/model names are introduced.
+    # Use the actual predicted wall contours instead of an artificial bounding-box room.
+    scale = 0.025
     room_w, room_d = xmax-xmin, ymax-ymin
+    thickness = max(0.07, min(0.16, min(room_w, room_d) * 0.025))
+    wall_segments = _wall_segments(geometry, scale)
+    for x0, y0, x1, y1 in wall_segments:
+        _add_wall_segment(ax, x0, y0, x1, y1, wall_h, thickness, palette["wall"])
+
+    # If the model misses walls, add only a very light shell as a fallback.
+    if not wall_segments:
+        t = max(0.08, min(0.14, min(room_w, room_d) * 0.025))
+        cuboid(ax, xmin, xmax, ymin, ymin+t, 0, wall_h, palette["wall"])
+        cuboid(ax, xmin, xmax, ymax-t, ymax, 0, wall_h, palette["wall"])
+        cuboid(ax, xmin, xmin+t, ymin, ymax, 0, wall_h, palette["wall"])
+        cuboid(ax, xmax-t, xmax, ymin, ymax, 0, wall_h, palette["wall"])
+
+    # Doors/windows are shown as simple architectural panels at their detected locations.
+    for poly in geometry.get("door", []):
+        _add_panel(ax, poly, scale, 2.0, palette["wood"], 0.95)
+    for poly in geometry.get("window", []):
+        _add_panel(ax, poly, scale, 1.25, "#9FB8C9", 0.72)
+
     cx, cy = (xmin+xmax)/2, (ymin+ymax)/2
     sofa_w = min(room_w*0.42, 2.4)
     sofa_d = min(room_d*0.16, 0.9)
@@ -253,15 +337,12 @@ def make_cg(geometry, style_name, lighting, view_name):
     table_w = min(room_w*0.25, 1.5)
     table_d = min(room_d*0.16, 0.85)
     cuboid(ax, cx-table_w/2, cx+table_w/2, cy-table_d/2, cy+table_d/2, 0.55, 0.68, palette["wood"])
-    # kitchen counter along the opposite side
     counter_d = min(room_d*0.12, 0.65)
     cuboid(ax, xmin+room_w*0.08, xmin+room_w*0.08+min(room_w*0.38,2.6), ymax-room_d*0.12, ymax-room_d*0.12+counter_d, 0.78, 0.92, palette["wood"])
-    # dining table and chairs as compact blocks
     if view_name in ("ダイニング", "キッチン", "LDK"):
         dw, dd = min(room_w*0.20, 1.2), min(room_d*0.14, 0.75)
         cuboid(ax, xmax-room_w*0.30, xmax-room_w*0.30+dw, cy-dd/2, cy+dd/2, 0.68, 0.76, palette["wood"])
 
-    # Lighting is represented by a subtle emissive ceiling volume.
     if lighting == "夜・間接照明":
         for frac in (0.28, 0.5, 0.72):
             x = xmin + room_w*frac
@@ -270,29 +351,23 @@ def make_cg(geometry, style_name, lighting, view_name):
         cuboid(ax, xmin+room_w*0.35, xmin+room_w*0.65, ymax-0.10, ymax-0.04, wall_h-0.05, wall_h, "#FFE2B0", 0.85)
 
     if view_name == "玄関":
-        elev = 18
-        azim = -65
+        elev, azim = 18, -65
     elif view_name == "キッチン":
-        elev = 20
-        azim = 25
+        elev, azim = 20, 25
     elif view_name == "ダイニング":
-        elev = 22
-        azim = -25
+        elev, azim = 22, -25
     else:
-        elev = 21
-        azim = -55
+        elev, azim = 24, -55
     ax.view_init(elev=elev, azim=azim)
     ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax); ax.set_zlim(0, wall_h)
     ax.set_box_aspect((max(room_w,0.1), max(room_d,0.1), wall_h))
     ax.set_axis_off()
-    # Stable framing and lighting-like tonal modulation.
-    ax.set_title(f"{view_name} / {style_name} / {lighting}", pad=8, fontsize=12)
+    # Do not render Japanese text inside Matplotlib; Streamlit renders the caption correctly.
     fig.tight_layout(pad=0.5)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
-    return Image.open(buf).convert("RGB")
-
+    return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
 
 def color_mask(mask):
     colors = [(238,238,234),(55,55,60),(225,125,55),(55,150,225)]

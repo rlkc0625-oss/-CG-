@@ -1,462 +1,296 @@
-import gc
-import hashlib
-import io
-import json
-import math
-import time
+import io, os, math, json, hashlib, tempfile
 from pathlib import Path
-
-import cv2
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
+import cv2
 import requests
 import streamlit as st
-import torch
-import segmentation_models_pytorch as smp
 from PIL import Image, ImageOps, ImageEnhance
-from safetensors.torch import load_file
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import plotly.graph_objects as go
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+from shapely.ops import unary_union, triangulate
+import trimesh
 
-st.set_page_config(page_title="図面→内観CGメーカー", page_icon="🏠", layout="wide")
+st.set_page_config(page_title='図面→3D内観CG', page_icon='🏠', layout='wide')
 
-MODEL_URL = "https://huggingface.co/Yytsi/floorplan-to-3d-walls/resolve/main/best.safetensors"
-MODEL_SHA256 = "d7f6a0fd06e2931aecfc8c4849192c5e153701578026efc78d9a6246731a8d6c"
-MODEL_SIZE = 97851168
-MODEL_PATH = Path("best.safetensors")
-SIZE = 512
-MAX_MB = 15
-CLASSES = ("floor", "wall", "door", "window")
-MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+MODEL_URL = 'https://huggingface.co/Yytsi/floorplan-to-3d-walls/resolve/main/best.safetensors?download=true'
+MODEL_SHA256 = 'd7f6a0fd06e2931aecfc8c4849192c5e153701578026efc78d9a6246731a8d6c'
+MODEL_BYTES = 97991168
+CACHE = Path.home() / '.cache' / 'floorplan_cg'
+MODEL_PATH = CACHE / 'best.safetensors'
 
-STYLE = {
-    "ナチュラル": {"wall": "#F2EEE5", "floor": "#C9A77A", "wood": "#A97B50", "accent": "#8B6B4E"},
-    "グレージュモダン": {"wall": "#D8D2C8", "floor": "#B9AFA2", "wood": "#8E7965", "accent": "#5F5B57"},
-    "モダン和風": {"wall": "#E7E1D6", "floor": "#9B7656", "wood": "#6E4D38", "accent": "#403B36"},
-    "ホテルライク": {"wall": "#D7D7D5", "floor": "#77736D", "wood": "#5E544A", "accent": "#2F3032"},
-    "北欧": {"wall": "#F4F2EC", "floor": "#D1B18A", "wood": "#B28A62", "accent": "#66706A"},
+STYLES = {
+    'ナチュラル': {'floor':'#c9a77a','wall':'#f2eee6','ceiling':'#faf9f5','wood':'#b58b5b','accent':'#d8c8b2','glass':'#b8d9e8'},
+    'グレージュモダン': {'floor':'#9c9187','wall':'#d8d3cb','ceiling':'#f3f0eb','wood':'#806b5a','accent':'#77716c','glass':'#b7d4df'},
+    'ホテルライク': {'floor':'#77716c','wall':'#d6d0c8','ceiling':'#efede8','wood':'#554b45','accent':'#8c7d6d','glass':'#b5d0da'},
+    '北欧': {'floor':'#d8be91','wall':'#f4f1e9','ceiling':'#fffdf9','wood':'#c29b69','accent':'#c8d0c6','glass':'#b9d8e5'},
+    '和モダン': {'floor':'#6d5b4d','wall':'#e3ddd3','ceiling':'#f3eee5','wood':'#765d4b','accent':'#988a76','glass':'#b5ced6'},
 }
 
 
 def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
+    h=hashlib.sha256()
+    with open(path,'rb') as f:
+        for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
     return h.hexdigest()
 
 
-def ensure_model():
-    if MODEL_PATH.exists():
-        try:
-            if MODEL_PATH.stat().st_size == MODEL_SIZE and sha256(MODEL_PATH) == MODEL_SHA256:
-                return
-            MODEL_PATH.unlink()
-        except OSError as e:
-            raise RuntimeError("AIモデルを確認できません。アプリを再起動してください。") from e
-
-    tmp = MODEL_PATH.with_suffix(".download")
-    last = None
-    for attempt in range(3):
-        try:
-            if tmp.exists():
-                tmp.unlink()
-            with requests.get(MODEL_URL, stream=True, timeout=(20, 180), headers={"User-Agent": "floorplan-cg-app"}) as r:
-                if r.status_code == 429:
-                    raise RuntimeError("Hugging Faceの一時的なアクセス制限です。少し時間を置いて再試行してください。")
-                r.raise_for_status()
-                with open(tmp, "wb") as f:
-                    for chunk in r.iter_content(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-            if tmp.stat().st_size != MODEL_SIZE:
-                raise RuntimeError("AIモデルのダウンロードサイズが一致しません。")
-            if sha256(tmp) != MODEL_SHA256:
-                raise RuntimeError("AIモデルの整合性確認に失敗しました。")
-            tmp.replace(MODEL_PATH)
-            return
-        except Exception as e:
-            last = e
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError("AIモデルを取得できませんでした。") from last
+def download_model():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size == MODEL_BYTES:
+        if sha256(MODEL_PATH) == MODEL_SHA256: return MODEL_PATH
+        MODEL_PATH.unlink(missing_ok=True)
+    tmp=MODEL_PATH.with_suffix('.part')
+    try:
+        with requests.get(MODEL_URL, stream=True, timeout=(15,180), headers={'User-Agent':'floorplan-cg/1.0'}) as r:
+            r.raise_for_status()
+            total=0
+            with open(tmp,'wb') as f:
+                for chunk in r.iter_content(1024*1024):
+                    if chunk:
+                        f.write(chunk); total += len(chunk)
+                        if total > MODEL_BYTES + 1024*1024: raise RuntimeError('モデルサイズが想定値を超えました。')
+        if total != MODEL_BYTES or sha256(tmp) != MODEL_SHA256:
+            raise RuntimeError('AIモデルの整合性確認に失敗しました。')
+        os.replace(tmp, MODEL_PATH)
+        return MODEL_PATH
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 @st.cache_resource(show_spinner=False)
 def load_model():
-    ensure_model()
-    model = smp.Unet(encoder_name="resnet34", encoder_weights=None, in_channels=3, classes=4)
-    state = load_file(str(MODEL_PATH), device="cpu")
+    import torch
+    import segmentation_models_pytorch as smp
+    from safetensors.torch import load_file
+    p=download_model()
+    model=smp.Unet(encoder_name='resnet34', encoder_weights=None, in_channels=3, classes=4)
+    state=load_file(str(p), device='cpu')
     model.load_state_dict(state, strict=True)
     model.eval()
     return model
 
 
-def read_image(uploaded):
-    raw = uploaded.getvalue()
-    if not raw:
-        raise ValueError("画像ファイルが空です。")
-    if len(raw) > MAX_MB * 1024 * 1024:
-        raise ValueError(f"画像は{MAX_MB}MB以下にしてください。")
-    try:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
-    except Exception as e:
-        raise ValueError("PNG/JPG/JPEG/WEBPの図面を使用してください。") from e
-    if img.width < 100 or img.height < 100:
-        raise ValueError("画像が小さすぎます。")
-    return img
+def read_image(upload):
+    data=upload.getvalue()
+    if not data: raise ValueError('画像が空です。')
+    if len(data)>25*1024*1024: raise ValueError('画像は25MB以下にしてください。')
+    im=Image.open(io.BytesIO(data))
+    im=ImageOps.exif_transpose(im).convert('RGB')
+    if min(im.size)<300: raise ValueError('解像度が低すぎます。')
+    if max(im.size)>2400:
+        s=2400/max(im.size); im=im.resize((round(im.width*s),round(im.height*s)),Image.Resampling.LANCZOS)
+    return im
 
 
-def auto_crop(img):
-    """Remove large photographic/blank margins while preserving the drawing."""
-    arr = np.asarray(img.convert("RGB"))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    # Keep pixels sufficiently darker than paper/background.
-    mask = (gray < 245).astype(np.uint8) * 255
-    kernel = np.ones((7, 7), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    ys, xs = np.where(mask > 0)
-    if len(xs) < 500:
-        return img
-    x0, x1 = max(0, xs.min() - 12), min(img.width, xs.max() + 13)
-    y0, y1 = max(0, ys.min() - 12), min(img.height, ys.max() + 13)
-    crop = img.crop((x0, y0, x1, y1))
-    # Avoid pathological tiny crops.
-    if crop.width < img.width * 0.15 or crop.height < img.height * 0.15:
-        return img
-    return crop
-
-
-def preprocess(image):
-    w, h = image.size
-    scale = min(SIZE / w, SIZE / h)
-    iw, ih = max(1, round(w * scale)), max(1, round(h * scale))
-    resized = image.resize((iw, ih), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGB", (SIZE, SIZE), (124, 124, 124))
-    left, top = (SIZE - iw) // 2, (SIZE - ih) // 2
-    canvas.paste(resized, (left, top))
-    arr = np.asarray(canvas).astype(np.float32) / 255.0
-    arr = (arr - MEAN) / STD
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-    return canvas, tensor, (left, top, iw, ih)
-
-
-def candidate_images(image):
-    cropped = auto_crop(image)
-    candidates = []
-    seen = set()
-    for source_name, src in (("original", image), ("cropped", cropped)):
-        gray = ImageOps.grayscale(src).convert("RGB")
-        enhanced = ImageEnhance.Contrast(gray).enhance(1.35)
-        for angle in (0, 90, 180, 270):
-            base = src.rotate(angle, expand=True) if angle else src
-            key = (base.size, source_name, angle)
-            if key not in seen:
-                candidates.append((f"{source_name}-{angle}", base))
-                seen.add(key)
-            if angle == 0:
-                candidates.append((f"{source_name}-contrast", enhanced))
-    return candidates
-
-
-def score_mask(mask):
-    total = float(mask.size)
-    ratios = [float(np.mean(mask == i)) for i in range(4)]
-    wall, door, window = ratios[1], ratios[2], ratios[3]
-    floor = ratios[0]
-    # Prefer a meaningful floor plus architectural classes, reject near-uniform predictions.
-    score = 0.0
-    score += 4.0 * min(floor / 0.20, 1.0)
-    score += 4.0 * min(wall / 0.025, 1.0)
-    score += 2.0 * min(door / 0.004, 1.0)
-    score += 2.0 * min(window / 0.004, 1.0)
-    if floor > 0.92 or wall > 0.25:
-        score -= 6.0
-    # Spatial spread matters: useful structures should not live in a tiny corner.
-    ys, xs = np.where(np.isin(mask, [1, 2, 3]))
-    if len(xs) > 100:
-        spread = ((xs.max()-xs.min()) / SIZE) * ((ys.max()-ys.min()) / SIZE)
-        score += 3.0 * min(spread / 0.25, 1.0)
-    return score
-
-
-def predict(image):
-    model = load_model()
-    best = None
-    errors = []
-    candidates = candidate_images(image)
-    progress = st.progress(0, text="図面の向き・余白を確認しています…")
-    try:
-        for idx, (name, candidate) in enumerate(candidates):
-            try:
-                canvas, tensor, rect = preprocess(candidate)
-                with torch.inference_mode():
-                    logits = model(tensor.unsqueeze(0))
-                    mask = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
-                score = score_mask(mask)
-                if best is None or score > best[0]:
-                    best = (score, name, canvas, mask, rect)
-            except RuntimeError as e:
-                if "memory" in str(e).lower():
-                    raise RuntimeError("AI推論でメモリ不足になりました。図面画像を少し小さくして再試行してください。") from e
-                errors.append(f"{name}: {e}")
-            progress.progress((idx + 1) / len(candidates))
-    finally:
-        progress.empty()
-    gc.collect()
-    if best is None:
-        raise RuntimeError("図面のAI解析に失敗しました。別の画像形式で再試行してください。")
-    _, chosen, canvas, mask, rect = best
-    # Keep only the content rectangle; this prevents letterbox artifacts from becoming geometry.
-    left, top, iw, ih = rect
-    cleaned = np.zeros_like(mask)
-    cleaned[top:top + ih, left:left + iw] = mask[top:top + ih, left:left + iw]
-    return canvas, cleaned, rect, chosen
-
-
-def extract_polygons(mask, class_id):
-    binary = (mask == class_id).astype(np.uint8)
-    if binary.sum() == 0:
-        return []
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    if hierarchy is None:
-        return []
-    hierarchy = hierarchy[0]
-    holes = {}
-    for i, (_, _, _, parent) in enumerate(hierarchy):
-        if parent != -1:
-            holes.setdefault(parent, []).append(i)
-    result = []
-    for i, (_, _, _, parent) in enumerate(hierarchy):
-        if parent != -1 or cv2.contourArea(contours[i]) < 30:
-            continue
-        outer = cv2.approxPolyDP(contours[i], 1.5, True).reshape(-1, 2).astype(float).tolist()
-        if len(outer) < 3:
-            continue
-        result.append({"outer": outer, "holes": [cv2.approxPolyDP(contours[j], 1.5, True).reshape(-1, 2).astype(float).tolist() for j in holes.get(i, []) if cv2.contourArea(contours[j]) >= 30]})
-    return result
-
-
-def make_geometry(mask):
-    return {name: extract_polygons(mask, i) for i, name in enumerate(CLASSES)}
-
-
-def polygon_area(poly):
-    p = np.asarray(poly, dtype=float)
-    if len(p) < 3:
-        return 0.0
-    return abs(cv2.contourArea(p.astype(np.float32)))
-
-
-def _touches_canvas(poly, margin=3):
-    p = np.asarray(poly, dtype=float)
-    if len(p) == 0:
-        return True
-    return bool((p[:,0].min() <= margin) or (p[:,1].min() <= margin) or (p[:,0].max() >= SIZE-1-margin) or (p[:,1].max() >= SIZE-1-margin))
-
-
-def largest_floor(geometry):
-    floors = geometry.get("floor", [])
-    candidates = [p for p in floors if not _touches_canvas(p.get("outer", []))]
-    if not candidates:
-        candidates = floors
-    return max(candidates, key=lambda p: polygon_area(p["outer"]), default=None)
-
-
-def _all_points(geometry):
-    pts = []
-    for name in ("wall", "door", "window"):
-        for poly in geometry.get(name, []):
-            pts.extend(poly.get("outer", []))
-    return np.asarray(pts, dtype=float) if pts else None
-
-
-def bounds_from_geometry(geometry, scale):
-    pts = _all_points(geometry)
-    if pts is None or len(pts) < 4:
-        return None
-    x0, x1 = float(pts[:,0].min()), float(pts[:,0].max())
-    y0, y1 = float(pts[:,1].min()), float(pts[:,1].max())
-    if x1-x0 < 30 or y1-y0 < 30:
-        return None
-    return (x0*scale, x1*scale, (SIZE-y1)*scale, (SIZE-y0)*scale)
-
-
-def bounds_from_mask(mask, scale):
-    m = np.isin(mask, [0,1,2,3]).astype(np.uint8)
-    # Prefer non-background predicted pixels, but exclude only tiny isolated components.
-    ys, xs = np.where(m > 0)
-    if len(xs) < 100:
-        return None
-    x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
-    if x1-x0 < 30 or y1-y0 < 30:
-        return None
-    return (x0*scale, x1*scale, (SIZE-y1)*scale, (SIZE-y0)*scale)
-
-
-def choose_bounds(geometry, mask, scale):
-    fp = largest_floor(geometry)
-    if fp is not None:
-        p = np.asarray(fp["outer"], dtype=float)
-        if len(p) >= 3 and polygon_area(p) >= 800:
-            q = np.column_stack([p[:,0]*scale, (SIZE-p[:,1])*scale])
-            return (q[:,0].min(), q[:,0].max(), q[:,1].min(), q[:,1].max())
-    return bounds_from_geometry(geometry, scale) or bounds_from_mask(mask, scale) or (0.5, 12.0, 0.5, 8.0)
-
-
-def _wall_segments(geometry, scale):
-    segments = []
-    for poly in geometry.get("wall", []):
-        p = np.asarray(poly.get("outer", []), dtype=float)
-        if len(p) < 2:
-            continue
-        for a,b in zip(p, np.vstack([p[1:],p[:1]])):
-            x0,y0=float(a[0]*scale),(SIZE-float(a[1]))*scale
-            x1,y1=float(b[0]*scale),(SIZE-float(b[1]))*scale
-            length=math.hypot(x1-x0,y1-y0)
-            if length >= 0.10:
-                segments.append((x0,y0,x1,y1))
-    return segments
-
-
-def cuboid(ax,x0,x1,y0,y1,z0,z1,color,alpha=1.0):
-    verts=[[(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)],[(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)],[(x0,y0,z0),(x1,y0,z0),(x1,y0,z1),(x0,y0,z1)],[(x1,y0,z0),(x1,y1,z0),(x1,y1,z1),(x1,y0,z1)],[(x1,y1,z0),(x0,y1,z0),(x0,y1,z1),(x1,y1,z1)],[(x0,y1,z0),(x0,y0,z0),(x0,y0,z1),(x0,y1,z1)]]
-    ax.add_collection3d(Poly3DCollection(verts,facecolors=color,edgecolors="none",alpha=alpha))
-
-
-def add_wall(ax,x0,y0,x1,y1,height,thickness,color):
-    dx,dy=x1-x0,y1-y0; L=math.hypot(dx,dy)
-    if L<1e-6:return
-    nx,ny=-dy/L,dx/L; t=thickness/2
-    p0=(x0+nx*t,y0+ny*t);p1=(x1+nx*t,y1+ny*t);p2=(x1-nx*t,y1-ny*t);p3=(x0-nx*t,y0-ny*t)
-    verts=[[(p0[0],p0[1],0),(p1[0],p1[1],0),(p1[0],p1[1],height),(p0[0],p0[1],height)],[(p1[0],p1[1],0),(p2[0],p2[1],0),(p2[0],p2[1],height),(p1[0],p1[1],height)],[(p2[0],p2[1],0),(p3[0],p3[1],0),(p3[0],p3[1],height),(p2[0],p2[1],height)],[(p3[0],p3[1],0),(p0[0],p0[1],0),(p0[0],p0[1],height),(p3[0],p3[1],height)]]
-    ax.add_collection3d(Poly3DCollection(verts,facecolors=color,edgecolors="none",alpha=.98))
-
-
-def add_panel(ax,poly,scale,height,color,alpha=.8):
-    p=np.asarray(poly.get("outer",[]),dtype=float)
-    if len(p)<3:return
-    q=np.column_stack([p[:,0]*scale,(SIZE-p[:,1])*scale]); cx,cy=q[:,0].mean(),q[:,1].mean()
-    rx=max((q[:,0].max()-q[:,0].min())/2,.025); ry=max((q[:,1].max()-q[:,1].min())/2,.025)
-    if rx>=ry:
-        x0,x1=cx-rx,cx+rx; y0,y1=cy-.04,cy+.04
-    else:
-        x0,x1=cx-.04,cx+.04; y0,y1=cy-ry,cy+ry
-    cuboid(ax,x0,x1,y0,y1,0,height,color,alpha)
-
-
-def make_cg(geometry,style_name,lighting,view_name,mask):
-    scale=.025; wall_h=2.4; palette=STYLE[style_name]
-    xmin,xmax,ymin,ymax=choose_bounds(geometry,mask,scale)
-    room_w=max(xmax-xmin,.5); room_d=max(ymax-ymin,.5)
-    fig=plt.figure(figsize=(10,7),dpi=160); ax=fig.add_subplot(111,projection="3d")
-    fig.patch.set_facecolor("#ECEAE5"); ax.set_facecolor("#ECEAE5")
-    cuboid(ax,xmin,xmax,ymin,ymax,0,.06,palette["floor"],1)
-    walls=_wall_segments(geometry,scale)
-    thickness=max(.07,min(.16,min(room_w,room_d)*.025))
-    for s in walls:add_wall(ax,*s,wall_h,thickness,palette["wall"])
-    if not walls:
-        t=max(.08,min(.14,min(room_w,room_d)*.025))
-        cuboid(ax,xmin,xmax,ymin,ymin+t,0,wall_h,palette["wall"]);cuboid(ax,xmin,xmax,ymax-t,ymax,0,wall_h,palette["wall"]);cuboid(ax,xmin,xmin+t,ymin,ymax,0,wall_h,palette["wall"]);cuboid(ax,xmax-t,xmax,ymin,ymax,0,wall_h,palette["wall"])
-    for p in geometry.get("door",[]):add_panel(ax,p,scale,2.0,palette["wood"],.95)
-    for p in geometry.get("window",[]):add_panel(ax,p,scale,1.25,"#8FAFC4",.7)
-    cx,cy=(xmin+xmax)/2,(ymin+ymax)/2
-    sofa_w=min(room_w*.42,2.4); sofa_d=min(room_d*.16,.9)
-    cuboid(ax,cx-sofa_w/2,cx+sofa_w/2,ymin+room_d*.18,ymin+room_d*.18+sofa_d,.12,.48,palette["accent"])
-    table_w=min(room_w*.25,1.5); table_d=min(room_d*.16,.85)
-    cuboid(ax,cx-table_w/2,cx+table_w/2,cy-table_d/2,cy+table_d/2,.55,.68,palette["wood"])
-    if view_name in ("LDK","キッチン","ダイニング"):
-        cuboid(ax,xmin+room_w*.08,xmin+room_w*.46,ymax-room_d*.13,ymax-room_d*.03,.78,.92,palette["wood"])
-    if lighting=="夜・間接照明":
-        for frac in (.28,.5,.72):
-            x=xmin+room_w*frac; cuboid(ax,x-.08,x+.08,ymax-.18,ymax-.08,wall_h-.08,wall_h-.02,"#FFF2C7",.9)
-    elif lighting=="夕方・暖色":
-        cuboid(ax,xmin+room_w*.35,xmin+room_w*.65,ymax-.10,ymax-.04,wall_h-.05,wall_h,"#FFE2B0",.85)
-    elev,azim={"玄関":(18,-65),"キッチン":(20,25),"ダイニング":(22,-25)}.get(view_name,(24,-55))
-    ax.view_init(elev=elev,azim=azim); ax.set_xlim(xmin,xmax);ax.set_ylim(ymin,ymax);ax.set_zlim(0,wall_h);ax.set_box_aspect((room_w,room_d,wall_h));ax.set_axis_off()
-    fig.tight_layout(pad=.5); buf=io.BytesIO();fig.savefig(buf,format="png",bbox_inches="tight",facecolor=fig.get_facecolor());plt.close(fig)
-    return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
-
-
-def color_mask(mask):
-    colors=[(238,238,234),(55,55,60),(225,125,55),(55,150,225)]
-    out=np.zeros((SIZE,SIZE,3),dtype=np.uint8)
-    for i,c in enumerate(colors):out[mask==i]=c
+def deskew_crop(im):
+    a=np.asarray(im); g=cv2.cvtColor(a,cv2.COLOR_RGB2GRAY)
+    # background suppression and page quadrilateral
+    blur=cv2.GaussianBlur(g,(5,5),0)
+    edges=cv2.Canny(blur,40,120)
+    cnts,_=cv2.findContours(edges,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+    H,W=g.shape; best=None
+    for c in sorted(cnts,key=cv2.contourArea,reverse=True)[:30]:
+        peri=cv2.arcLength(c,True); poly=cv2.approxPolyDP(c,0.02*peri,True)
+        area=cv2.contourArea(c)
+        if len(poly)==4 and area>0.35*W*H:
+            pts=poly.reshape(4,2).astype(np.float32)
+            best=pts; break
+    if best is None: return im
+    def order(p):
+        s=p.sum(1); d=np.diff(p,axis=1).ravel(); return np.array([p[np.argmin(s)],p[np.argmin(d)],p[np.argmax(s)],p[np.argmax(d)]],np.float32)
+    p=order(best); tl,tr,br,bl=p
+    w=max(np.linalg.norm(tr-tl),np.linalg.norm(br-bl)); h=max(np.linalg.norm(bl-tl),np.linalg.norm(br-tr))
+    w=int(max(800,min(2400,w))); h=int(max(600,min(2400,h)))
+    dst=np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]],np.float32)
+    M=cv2.getPerspectiveTransform(p,dst)
+    out=cv2.warpPerspective(a,M,(w,h),borderValue=(255,255,255))
     return Image.fromarray(out)
 
 
-def overlay(base,mask):
-    out=np.asarray(base).copy().astype(np.float32)
-    for i,c in ((1,(55,55,60)),(2,(225,125,55)),(3,(55,150,225))):
-        m=mask==i;out[m]=out[m]*.4+np.asarray(c)*.6
-    return Image.fromarray(np.clip(out,0,255).astype(np.uint8))
+def letterbox(im,size=512):
+    a=np.asarray(im); h,w=a.shape[:2]; s=min(size/w,size/h); nw,nh=max(1,round(w*s)),max(1,round(h*s))
+    r=cv2.resize(a,(nw,nh),interpolation=cv2.INTER_AREA)
+    canvas=np.full((size,size,3),255,np.uint8); x=(size-nw)//2; y=(size-nh)//2; canvas[y:y+nh,x:x+nw]=r
+    return canvas,(s,x,y,nw,nh)
 
 
-def structure_json(geometry,rect,chosen):
-    return {"version":3,"canvas_size":[SIZE,SIZE],"content_rect":list(rect),"classes":CLASSES,"polygons":geometry,"preprocess_variant":chosen,"note":"AI解析から生成した近似3Dプレビューです。施工図精度は保証しません。"}
+def predict_masks(im,model):
+    import torch
+    x,meta=letterbox(im,512)
+    t=torch.from_numpy(x.astype(np.float32)/255.).permute(2,0,1).unsqueeze(0)
+    mean=torch.tensor([0.485,0.456,0.406]).view(1,3,1,1); std=torch.tensor([0.229,0.224,0.225]).view(1,3,1,1)
+    t=(t-mean)/std
+    with torch.inference_mode(): logits=model(t); cls=logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
+    s,px,py,nw,nh=meta; orig=np.asarray(im).shape[:2]
+    crop=cls[py:py+nh,px:px+nw]
+    crop=cv2.resize(crop,(orig[1],orig[0]),interpolation=cv2.INTER_NEAREST)
+    return crop
 
 
-def make_obj(geometry):
-    scale=.02; heights={"wall":2.4,"door":2.0,"window":1.2}; lines=["# floorplan-to-3d preview","# Approximate scale only"];vc=0
-    for name in ("wall","door","window"):
-        for poly in geometry.get(name,[]):
-            pts=poly.get("outer",[])
-            if len(pts)<3:continue
-            base=vc+1
-            for x,y in pts:lines.append(f"v {x*scale:.4f} {(SIZE-y)*scale:.4f} 0")
-            for x,y in pts:lines.append(f"v {x*scale:.4f} {(SIZE-y)*scale:.4f} {heights[name]:.4f}")
-            n=len(pts);lines.append(f"g {name}")
-            for i in range(n):
-                j=(i+1)%n;lines.append(f"f {base+i} {base+j} {base+n+j} {base+n+i}")
-            vc+=n*2
-    return "\n".join(lines)+"\n"
-
-
-st.title("🏠 図面 → 内観CGメーカー")
-st.caption("図面の余白・向きを自動補正して構造解析し、3D内観プレビューまで生成します。")
-uploaded=st.file_uploader("① 間取り図をアップロード",type=["png","jpg","jpeg","webp"])
-style=st.selectbox("② 内装テイスト",list(STYLE.keys()))
-lighting=st.selectbox("③ 照明",["昼・自然光","夕方・暖色","夜・間接照明"])
-view=st.selectbox("④ 視点",["LDK","リビング","キッチン","ダイニング","玄関"])
-
-if uploaded:
-    try:
-        original=read_image(uploaded);st.image(original,caption="元の間取り図",use_container_width=True)
-    except Exception as e:
-        st.error(str(e));st.stop()
-    if st.button("🚀 図面からCGを作成",type="primary",use_container_width=True):
+def polygons_from_mask(mask, cls, min_area=150):
+    b=(mask==cls).astype(np.uint8)
+    b=cv2.morphologyEx(b,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+    contours,hier=cv2.findContours(b,cv2.RETR_CCOMP,cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None: return []
+    polys=[]
+    for i,c in enumerate(contours):
+        if hier[0][i][3]!=-1: continue
+        if cv2.contourArea(c)<min_area: continue
+        ext=cv2.approxPolyDP(c,1.5,True).reshape(-1,2)
+        if len(ext)<3: continue
+        holes=[]
+        child=hier[0][i][2]
+        while child!=-1:
+            hc=contours[child]
+            if cv2.contourArea(hc)>=20:
+                holes.append(cv2.approxPolyDP(hc,1.5,True).reshape(-1,2))
+            child=hier[0][child][0]
         try:
-            with st.spinner("AIモデルを準備しています…"):load_model()
-            with st.spinner("図面を自動補正して解析しています…"):
-                processed,mask,rect,chosen=predict(original);geometry=make_geometry(mask)
-            counts={k:len(geometry[k]) for k in ("wall","door","window")}
-            c1,c2,c3=st.columns(3)
-            with c1:st.image(processed,caption=f"AI入力（自動選択: {chosen}）",use_container_width=True)
-            with c2:st.image(color_mask(mask),caption="AI判定",use_container_width=True)
-            with c3:st.image(overlay(processed,mask),caption="構造確認",use_container_width=True)
-            st.write(f"壁 {counts['wall']} / ドア {counts['door']} / 窓 {counts['window']}")
-            if sum(counts.values())==0:
-                st.error("構造を認識できませんでした。図面をできるだけ正面から撮影し、余白を減らして再試行してください。")
-                st.stop()
-            with st.spinner("3D内観CGを生成しています…"):cg=make_cg(geometry,style,lighting,view,mask)
-            st.success("3D内観CGの生成が完了しました。")
-            st.image(cg,caption=f"3D内観プレビュー｜{view}｜{style}｜{lighting}",use_container_width=True)
-            out=io.BytesIO();cg.save(out,format="PNG");st.download_button("📥 内観CG PNG",out.getvalue(),"interior_cg_preview.png","image/png",use_container_width=True)
-            data=structure_json(geometry,rect,chosen);st.download_button("📥 構造JSON",json.dumps(data,ensure_ascii=False,indent=2).encode(),"floorplan_structure.json","application/json",use_container_width=True)
-            st.download_button("📥 3D OBJ",make_obj(geometry).encode(),"floorplan_structure.obj","text/plain",use_container_width=True)
-            st.warning("このCGはAI解析結果から生成する近似3Dプレビューです。壁・窓・ドア位置、寸法、家具配置を施工図レベルでは保証しません。")
-        except requests.exceptions.RequestException as e:
-            st.error("AIモデル取得中の通信エラーです。時間を置いて再試行してください。")
-            with st.expander("詳細"):st.code(repr(e))
-        except RuntimeError as e:
-            st.error(str(e))
-            with st.expander("詳細"):st.exception(e)
-        except Exception as e:
-            st.error("予期しないエラーが発生しました。")
-            with st.expander("詳細"):st.exception(e)
-        finally:gc.collect()
+            p=Polygon(ext,holes=[h for h in holes if len(h)>=3]).buffer(0)
+            if not p.is_empty and p.area>=min_area: polys.append(p)
+        except Exception: pass
+    return polys
 
-st.divider();st.caption("構造モデル: Yytsi/floorplan-to-3d-walls / MIT。公開モデルはCubiCasa5K中心の学習のため、日本の実施設計図では誤認識する場合があります。")
+
+def to_world_geom(geom, px_per_m):
+    def cvpt(x,y): return (x/px_per_m,-y/px_per_m)
+    if isinstance(geom,Polygon):
+        ext=[cvpt(x,y) for x,y in geom.exterior.coords]
+        holes=[[cvpt(x,y) for x,y in r.coords] for r in geom.interiors]
+        return Polygon(ext,holes)
+    if isinstance(geom,MultiPolygon): return MultiPolygon([to_world_geom(g,px_per_m) for g in geom.geoms])
+    return geom
+
+
+def explode_polys(g):
+    if g.is_empty: return []
+    if isinstance(g,Polygon): return [g]
+    if isinstance(g,MultiPolygon): return [p for p in g.geoms if p.area>0]
+    if isinstance(g,GeometryCollection): return [p for p in g.geoms if isinstance(p,Polygon) and p.area>0]
+    return []
+
+
+def tri_faces(poly,z):
+    verts=[]; faces=[]
+    tris=triangulate(poly)
+    for t in tris:
+        if not poly.covers(t.representative_point()): continue
+        coords=list(t.exterior.coords)[:3]; base=len(verts); verts += [(x,y,z) for x,y in coords]; faces.append((base,base+1,base+2))
+    return verts,faces
+
+
+def extrude(poly,z0,z1):
+    verts=[]; faces=[]
+    coords=list(poly.exterior.coords)[:-1]
+    if len(coords)<3: return verts,faces
+    n=len(coords); verts += [(x,y,z0) for x,y in coords]+[(x,y,z1) for x,y in coords]
+    for i in range(n):
+        j=(i+1)%n; faces.append((i,j,n+j)); faces.append((i,n+j,n+i))
+    top=triangulate(poly)
+    for t in top:
+        if not poly.covers(t.representative_point()): continue
+        tc=list(t.exterior.coords)[:3]; b=len(verts); verts += [(x,y,z1) for x,y in tc]; faces.append((b,b+1,b+2))
+    return verts,faces
+
+
+def build_meshes(mask, px_per_m):
+    # labels: 0 floor, 1 wall, 2 door, 3 window
+    floor=unary_union(polygons_from_mask(mask,0,max(120,mask.shape[0]*mask.shape[1]*0.00015)))
+    wall=unary_union(polygons_from_mask(mask,1,max(40,mask.shape[0]*mask.shape[1]*0.00003)))
+    door=unary_union(polygons_from_mask(mask,2,max(30,mask.shape[0]*mask.shape[1]*0.00002)))
+    window=unary_union(polygons_from_mask(mask,3,max(30,mask.shape[0]*mask.shape[1]*0.00002)))
+    # keep wall only where near floor; then carve openings
+    if not wall.is_empty and not floor.is_empty:
+        wall=wall.buffer(3).intersection(floor.buffer(80))
+    opening=(door.union(window)).buffer(7) if not door.is_empty or not window.is_empty else GeometryCollection()
+    if not wall.is_empty and not opening.is_empty: wall=wall.difference(opening)
+    floor_world=to_world_geom(floor,px_per_m); wall_world=to_world_geom(wall,px_per_m); door_world=to_world_geom(door,px_per_m); window_world=to_world_geom(window,px_per_m)
+    return floor_world,wall_world,door_world,window_world
+
+
+def scene_mesh(floor,wall,door,window,style):
+    s=STYLES[style]; meshes=[]; names=[]
+    def add_geom(g,z0,z1,name,kind):
+        vv=[]; ff=[]
+        for p in explode_polys(g):
+            if z1>z0:
+                a,b=extrude(p,z0,z1)
+            else:
+                a,b=tri_faces(p,z0)
+            off=len(vv); vv.extend(a); ff.extend([(i+off,j+off,k+off) for i,j,k in b])
+        if vv and ff:
+            m=trimesh.Trimesh(vertices=np.array(vv),faces=np.array(ff),process=False)
+            m.remove_unreferenced_vertices(); meshes.append((name,m,kind))
+    add_geom(floor,0,0.06,'floor','floor')
+    add_geom(wall,0.06,2.45,'walls','wall')
+    # Doors/windows as panels; wall openings are carved above.
+    add_geom(door,0.06,2.15,'doors','door')
+    add_geom(window,0.95,2.20,'windows','window')
+    return meshes
+
+
+def plot_scene(meshes,style,lighting,view):
+    s=STYLES[style]; fig=go.Figure()
+    colors={'floor':s['floor'],'wall':s['wall'],'door':s['wood'],'window':s['glass']}
+    for name,m,kind in meshes:
+        v=m.vertices; f=m.faces
+        fig.add_trace(go.Mesh3d(x=v[:,0],y=v[:,1],z=v[:,2],i=f[:,0],j=f[:,1],k=f[:,2],color=colors.get(kind,s['wall']),opacity=0.92 if kind=='window' else 1.0,flatshading=True,name=name,hoverinfo='skip'))
+    eye={'LDK全体':dict(x=1.5,y=-1.5,z=1.2),'リビング→キッチン':dict(x=1.1,y=-1.9,z=1.0),'キッチン→リビング':dict(x=-1.3,y=1.7,z=1.0),'ダイニング→LDK':dict(x=1.7,y=0.8,z=1.0),'玄関':dict(x=-1.7,y=-0.6,z=1.0)}[view]
+    if lighting=='夕方・暖色': bg='#e9e0d5'
+    elif lighting=='夜・間接照明': bg='#25252a'
+    else: bg='#f5f3ef'
+    fig.update_layout(height=720,margin=dict(l=0,r=0,t=0,b=0),paper_bgcolor=bg,scene=dict(xaxis_visible=False,yaxis_visible=False,zaxis_visible=False,aspectmode='data',camera=dict(eye=eye)))
+    return fig
+
+
+def structural_score(mask):
+    areas=[int(np.sum(mask==i)) for i in range(4)]
+    total=sum(areas) or 1
+    # Healthy plan has meaningful floor/wall pixels, not almost all one class.
+    score=0
+    if areas[0]/total>0.08: score+=1
+    if areas[1]/total>0.005: score+=1
+    if areas[2]+areas[3]>20: score+=1
+    if max(areas)/total<0.92: score+=1
+    return score,areas
+
+
+st.title('🏠 図面 → 3D内観CG')
+st.caption('図面の構造を3Dメッシュへ再構築します。')
+upload=st.file_uploader('図面をアップロード',type=['jpg','jpeg','png','webp'])
+view=st.selectbox('視点',['LDK全体','リビング→キッチン','キッチン→リビング','ダイニング→LDK','玄関'])
+style=st.selectbox('インテリア',['ナチュラル','グレージュモダン','ホテルライク','北欧','和モダン'])
+lighting=st.selectbox('照明',['昼・自然光','夕方・暖色','夜・間接照明'])
+scale=st.number_input('図面縮尺（1mあたりの画素数）',min_value=20.0,max_value=500.0,value=80.0,step=5.0,help='寸法線が読めない写真でも3D寸法を安定させるための値です。')
+
+if upload:
+    try:
+        im=deskew_crop(read_image(upload))
+        st.image(im,caption='解析対象図面',use_container_width=True)
+        if st.button('3D内観を生成',type='primary',use_container_width=True):
+            with st.spinner('図面解析 → 形状再構築 → 開口処理 → 3Dメッシュ検証…'):
+                model=load_model()
+                mask=predict_masks(im,model)
+                score,areas=structural_score(mask)
+                if score<2: raise RuntimeError('図面の構造認識信頼度が低いため、安全のため3D生成を停止しました。')
+                floor,wall,door,window=build_meshes(mask,float(scale))
+                if floor.is_empty: raise RuntimeError('室内床領域を抽出できませんでした。')
+                if wall.is_empty: raise RuntimeError('壁領域を抽出できませんでした。')
+                meshes=scene_mesh(floor,wall,door,window,style)
+                if not meshes: raise RuntimeError('3Dメッシュを生成できませんでした。')
+                totalv=sum(len(m.vertices) for _,m,_ in meshes); totalf=sum(len(m.faces) for _,m,_ in meshes)
+                if totalv<30 or totalf<20: raise RuntimeError('3Dメッシュの情報量が不足しています。')
+                fig=plot_scene(meshes,style,lighting,view)
+                st.success(f'3D生成完了　床 {areas[0]:,}px / 壁 {areas[1]:,}px / ドア {areas[2]:,}px / 窓 {areas[3]:,}px')
+                st.plotly_chart(fig,use_container_width=True)
+                # Combined scene exports.
+                combined=trimesh.util.concatenate([m for _,m,_ in meshes])
+                glb=combined.export(file_type='glb'); obj=combined.export(file_type='obj')
+                st.download_button('3D GLB',glb,'floorplan_3d.glb','model/gltf-binary')
+                st.download_button('3D OBJ',obj,'floorplan_3d.obj','text/plain')
+                structure={'version':'real-3d-rebuild-1','scale_px_per_m':float(scale),'style':style,'lighting':lighting,'view':view,'pixel_area':areas,'mesh_vertices':totalv,'mesh_faces':totalf}
+                st.download_button('構造JSON',json.dumps(structure,ensure_ascii=False,indent=2).encode(),'structure.json','application/json')
+    except Exception as e:
+        st.error(f'生成できませんでした: {type(e).__name__}: {e}')
+        st.info('図面を正面から撮影し、建物部分ができるだけ大きく写った画像で再実行してください。')

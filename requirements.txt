@@ -1,3 +1,5 @@
 streamlit
 requests
 pillow
+gradio_client
+

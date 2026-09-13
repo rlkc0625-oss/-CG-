@@ -98,10 +98,15 @@ Do not show the floor plan itself in the final image.
         else:
             st.write(result)
 
-    except Exception as e:
-        st.error("生成に失敗しました。")
-        st.code(str(e))
+except Exception as e:
+    import traceback
 
+    st.error("生成に失敗しました。")
+    st.write("エラー種類：", type(e).__name__)
+    st.write("エラー内容：")
+    st.code(repr(e))
+    st.write("詳細ログ：")
+    st.code(traceback.format_exc())
     finally:
         try:
             os.remove(image_path)

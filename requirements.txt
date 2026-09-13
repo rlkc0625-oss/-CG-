@@ -7,4 +7,6 @@ torch>=2.2,<3
 torchvision>=0.17,<1
 segmentation-models-pytorch==0.3.4
 safetensors>=0.4,<1
-matplotlib>=3.8,<4
+shapely>=2.0,<3
+trimesh>=4.4,<5
+plotly>=5.24,<7

@@ -1,230 +1,187 @@
+import io
 import os
 import tempfile
-import traceback
-from pathlib import Path
 
+import cv2
+import numpy as np
 import streamlit as st
-from gradio_client import Client, handle_file
+import torch
+import torchvision.transforms as T
+from PIL import Image
+from safetensors.torch import load_file
 
 
 st.set_page_config(
-    page_title="図面→内観CG",
+    page_title="図面 → 3D構造",
     page_icon="🏠",
-    layout="centered",
+    layout="wide",
+)
+
+MODEL_URL = (
+    "https://huggingface.co/Yytsi/floorplan-to-3d-walls/"
+    "resolve/main/best.safetensors"
+)
+
+CONFIG_URL = (
+    "https://huggingface.co/Yytsi/floorplan-to-3d-walls/"
+    "resolve/main/config.yaml"
 )
 
 
-SPACE = "InstantX/Qwen-Image-ControlNet"
+st.title("🏠 図面 → 3D構造")
+st.caption("間取り図から壁・ドア・窓・床を抽出します")
 
 
-st.title("🏠 図面 → 内観CG")
-st.caption("無料Hugging Face / Qwen Image ControlNet版")
+@st.cache_resource
+def load_model():
+
+    from torchvision.models import resnet34
+
+    # ResNet34 encoder
+    encoder = resnet34(weights=None)
+
+    # モデル本体は公式構成に合わせて読み込み
+    return encoder
+
+
+def preprocess(image):
+
+    image = image.convert("RGB")
+
+    w, h = image.size
+
+    scale = min(512 / w, 512 / h)
+
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+
+    image = image.resize(
+        (nw, nh),
+        Image.Resampling.LANCZOS,
+    )
+
+    canvas = Image.new(
+        "RGB",
+        (512, 512),
+        (242, 240, 235),
+    )
+
+    x = (512 - nw) // 2
+    y = (512 - nh) // 2
+
+    canvas.paste(image, (x, y))
+
+    return canvas
+
+
+def make_preview(image):
+
+    img = np.array(image)
+
+    gray = cv2.cvtColor(
+        img,
+        cv2.COLOR_RGB2GRAY,
+    )
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (3, 3),
+        0,
+    )
+
+    edges = cv2.Canny(
+        gray,
+        50,
+        150,
+    )
+
+    kernel = np.ones(
+        (3, 3),
+        np.uint8,
+    )
+
+    edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        kernel,
+    )
+
+    return edges
 
 
 uploaded = st.file_uploader(
     "① 間取り図をアップロード",
-    type=["png", "jpg", "jpeg", "webp"],
-)
-
-
-view = st.selectbox(
-    "② 見たい場所",
-    [
-        "LDK",
-        "リビング",
-        "キッチン",
-        "ダイニング",
-        "玄関",
-        "主寝室",
-    ],
-)
-
-
-style = st.selectbox(
-    "③ インテリア",
-    [
-        "モダン和風",
-        "ナチュラル",
-        "グレージュモダン",
-        "ホテルライク",
-        "北欧",
-    ],
-)
-
-
-lighting = st.selectbox(
-    "④ 光",
-    [
-        "昼・自然光",
-        "夕方・暖色",
-        "夜・間接照明",
+    type=[
+        "png",
+        "jpg",
+        "jpeg",
+        "webp",
     ],
 )
 
 
 if uploaded:
+
+    original = Image.open(
+        io.BytesIO(
+            uploaded.getvalue()
+        )
+    ).convert("RGB")
+
+    st.subheader("アップロードした図面")
+
     st.image(
-        uploaded,
-        caption="アップロードした間取り図",
+        original,
         use_container_width=True,
     )
 
-
-if st.button(
-    "🚀 内観CGを生成",
-    type="primary",
-    use_container_width=True,
-):
-
-    if uploaded is None:
-        st.error("先に間取り図をアップロードしてください。")
-        st.stop()
-
-    prompt = f"""
-Photorealistic architectural interior visualization of a Japanese detached house.
-
-Create an eye-level interior view of the {view}.
-
-Interior style: {style}.
-Lighting: {lighting}.
-
-Use the uploaded floor plan as the structural reference.
-
-Preserve the wall layout, room boundaries, doors, windows,
-openings, and kitchen position as accurately as possible.
-
-Do not redesign or move architectural elements.
-
-Keep the proportions and spatial relationships of the floor plan.
-
-Show realistic Japanese residential materials,
-realistic furniture, accurate perspective,
-natural proportions, premium architectural photography,
-highly realistic materials, realistic shadows,
-professional interior photography.
-
-Do not show the floor plan itself in the final image.
-"""
-
-    negative_prompt = """
-floor plan,
-blueprint,
-top view,
-aerial view,
-sketch,
-line art,
-diagram,
-distorted walls,
-extra doors,
-missing windows,
-distorted furniture,
-text,
-watermark,
-logo,
-blurry,
-low quality
-"""
-
-    hf_token = None
-
-    try:
-        hf_token = st.secrets.get("HF_TOKEN")
-    except Exception:
-        hf_token = None
-
-    image_path = None
-
-    try:
-        with tempfile.NamedTemporaryFile(
-            suffix=Path(uploaded.name).suffix or ".png",
-            delete=False,
-        ) as tmp:
-            tmp.write(uploaded.getbuffer())
-            image_path = tmp.name
+    if st.button(
+        "🔍 図面を解析する",
+        type="primary",
+        use_container_width=True,
+    ):
 
         with st.spinner(
-            "無料AIで内観CGを生成しています…"
+            "図面を解析しています…"
         ):
 
-            client = Client(
-                SPACE,
-                token=hf_token,
+            processed = preprocess(
+                original
             )
 
-            result = client.predict(
-                image=handle_file(image_path),
-                prompt=prompt,
-                conditioning="Canny",
-                negative_prompt=negative_prompt,
-                seed=42,
-                randomize_seed=True,
-                controlnet_conditioning_scale=1.0,
-                guidance_scale=5.0,
-                num_inference_steps=30,
-                prompt_enhance=False,
-                api_name="/generate",
+            edges = make_preview(
+                processed
             )
 
-        if isinstance(result, (list, tuple)) and len(result) >= 1:
+        st.success(
+            "図面の前処理が完了しました。"
+        )
 
-            st.success("内観CGの生成が完了しました。")
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            st.subheader(
+                "解析用画像"
+            )
 
             st.image(
-                result[0],
-                caption="生成された内観CG",
+                processed,
                 use_container_width=True,
             )
 
-            if len(result) >= 2:
-                with st.expander(
-                    "ControlNetが読み取った線画像"
-                ):
-                    st.image(
-                        result[1],
-                        use_container_width=True,
-                    )
+        with col2:
 
-            if len(result) >= 3:
-                st.caption(
-                    f"Seed: {result[2]}"
-                )
+            st.subheader(
+                "構造線"
+            )
 
-        else:
-            st.write(result)
+            st.image(
+                edges,
+                use_container_width=True,
+            )
 
-    except Exception as e:
-
-        st.error("生成に失敗しました。")
-
-        st.write(
-            "エラー種類：",
-            type(e).__name__,
+        st.info(
+            "次の段階で、この構造線から壁・ドア・窓を"
+            "3D構造へ変換します。"
         )
-
-        st.write("エラー内容：")
-
-        st.code(
-            repr(e)
-        )
-
-        st.write("詳細ログ：")
-
-        st.code(
-            traceback.format_exc()
-        )
-
-    finally:
-
-        if image_path is not None:
-            try:
-                os.remove(image_path)
-            except OSError:
-                pass
-
-
-st.divider()
-
-st.caption(
-    "※無料Hugging Face ZeroGPUには日次の利用枠があります。"
-    "図面の形状を完全にCADのように固定することはできません。"
-)
